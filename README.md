@@ -10,21 +10,38 @@ Garmin Connect MCP server based on [garth](https://github.com/matin/garth).
 
 ## Usage
 
-### Standard MCP Client (stdio)
+## Quick Start
 
-![image](https://github.com/user-attachments/assets/14221e6f-5f65-4c21-bc7a-2147c1c9efc1)
+### For n8n MCP Client (HTTP Mode)
 
-### HTTP Streaming Mode (n8n MCP Client)
+1. **Start the HTTP server:**
+   ```bash
+   garth-mcp-server --http --port 8000
+   ```
 
-Run as an HTTP server with Bearer token authentication:
+2. **Configure n8n MCP Client:**
+   - URL: `http://your-server:8000/`
+   - Auth: `Bearer`
+   - Token: `<your_garth_token>`
 
-```bash
-garth-mcp-server --http --port 8000
-```
+3. **Use tools in n8n workflows** - all Garmin Connect data is now accessible via HTTP API!
 
-Or using Python directly:
-```bash
-python -m garth_mcp_server --http --port 8000
+### For Standard MCP Clients (stdio mode)
+
+Use the original configuration (no changes needed):
+
+```json
+{
+  "mcpServers": {
+    "Garth - Garmin Connect": {
+      "command": "uvx",
+      "args": ["garth-mcp-server"],
+      "env": {
+        "GARTH_TOKEN": "<output of `uvx garth login`>"
+      }
+    }
+  }
+}
 ```
 
 ## Install
