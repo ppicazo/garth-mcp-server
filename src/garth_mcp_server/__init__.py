@@ -2,6 +2,9 @@ import os
 from datetime import date
 from functools import wraps
 from urllib.parse import urlencode
+from typing import Optional
+import contextlib
+import threading
 
 import garth
 from mcp.server.fastmcp import FastMCP
@@ -9,15 +12,33 @@ from mcp.server.fastmcp import FastMCP
 
 __version__ = "0.0.8"
 
+# Thread-local storage for HTTP context (Bearer token)
+_context = threading.local()
+
 server = FastMCP("Garth - Garmin Connect", dependencies=["garth"])
+
+def set_bearer_token(token: str):
+    """Set the Bearer token for the current request context."""
+    _context.bearer_token = token
+
+def get_bearer_token() -> Optional[str]:
+    """Get the Bearer token from the current request context."""
+    return getattr(_context, 'bearer_token', None)
 
 
 def requires_garth_session(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
-        token = os.getenv("GARTH_TOKEN")
+        # First try to get token from HTTP Bearer authentication (HTTP mode)
+        token = get_bearer_token()
+        
+        # Fall back to environment variable (stdio mode for backward compatibility)
         if not token:
-            return "You must set the GARTH_TOKEN environment variable to use this tool"
+            token = os.getenv("GARTH_TOKEN")
+            
+        if not token:
+            return "Authentication required: You must provide a GARTH_TOKEN via Bearer authentication or environment variable to use this tool"
+        
         garth.client.loads(token)
         return func(*args, **kwargs)
 
@@ -387,7 +408,273 @@ def snapshot(from_date: date, to_date: date) -> str | dict | None:
 
 
 def main():
-    server.run()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Garth MCP Server")
+    parser.add_argument(
+        "--http", 
+        action="store_true", 
+        help="Run as HTTP server (default: stdio)"
+    )
+    parser.add_argument(
+        "--port", 
+        type=int, 
+        default=8000, 
+        help="Port for HTTP server (default: 8000)"
+    )
+    parser.add_argument(
+        "--host", 
+        default="0.0.0.0", 
+        help="Host for HTTP server (default: 0.0.0.0)"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.http:
+        # Run as HTTP server
+        run_http_server(args.host, args.port)
+    else:
+        # Run as stdio server (default)
+        server.run()
+
+def run_http_server(host: str = "0.0.0.0", port: int = 8000):
+    """Run the MCP server over HTTP with Bearer token authentication."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import json
+    import traceback
+    from urllib.parse import urlparse, parse_qs
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    
+    # Get the FastMCP server's tools for integration
+    server_tools = {}
+    
+    # Extract tool information from the FastMCP server
+    # This is a simplified approach - in practice, we'd integrate more deeply with FastMCP
+    try:
+        # Try to access FastMCP's internal tool registry
+        if hasattr(server, '_tools'):
+            server_tools = server._tools
+        elif hasattr(server, 'tools'):
+            server_tools = server.tools
+    except:
+        pass
+    
+    class MCPHTTPHandler(BaseHTTPRequestHandler):
+        def do_OPTIONS(self):
+            """Handle CORS preflight requests."""
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+            self.end_headers()
+        
+        def do_GET(self):
+            """Handle GET requests for health check and info."""
+            parsed_path = urlparse(self.path)
+            
+            if parsed_path.path == '/health':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                health_response = {
+                    "status": "healthy",
+                    "server": "Garth MCP Server",
+                    "version": __version__,
+                    "authentication": "Bearer token required"
+                }
+                self.wfile.write(json.dumps(health_response).encode('utf-8'))
+                return
+            
+            elif parsed_path.path == '/tools':
+                # Return available tools list
+                auth_header = self.headers.get('Authorization', '')
+                if not auth_header.startswith('Bearer '):
+                    self.send_error(401, 'Bearer token required')
+                    return
+                
+                # Basic token validation
+                token = auth_header[7:]
+                if not token:
+                    self.send_error(401, 'Invalid Bearer token')
+                    return
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                # List all available tools
+                tools_list = [
+                    {"name": "user_profile", "description": "Get user profile information"},
+                    {"name": "user_settings", "description": "Get user settings"},
+                    {"name": "daily_steps", "description": "Get daily steps data"},
+                    {"name": "daily_sleep", "description": "Get daily sleep data"},
+                    {"name": "get_activities", "description": "Get activities from Garmin Connect"},
+                    {"name": "get_body_composition", "description": "Get body composition data"},
+                    {"name": "snapshot", "description": "Get snapshot data for date ranges"},
+                    # Add more tools as needed
+                ]
+                
+                response = {
+                    "tools": tools_list,
+                    "count": len(tools_list)
+                }
+                self.wfile.write(json.dumps(response, indent=2).encode('utf-8'))
+                return
+                
+            else:
+                self.send_error(404, 'Not Found - Available endpoints: /health, /tools, POST /')
+        
+        def do_POST(self):
+            """Handle POST requests for tool execution."""
+            try:
+                # Extract Bearer token
+                auth_header = self.headers.get('Authorization', '')
+                if not auth_header.startswith('Bearer '):
+                    self.send_error(401, 'Bearer token required. Use Authorization: Bearer <your_garth_token>')
+                    return
+                
+                token = auth_header[7:]  # Remove 'Bearer ' prefix
+                if not token:
+                    self.send_error(401, 'Invalid Bearer token')
+                    return
+                    
+                set_bearer_token(token)
+                
+                # Read request body
+                content_length = int(self.headers.get('Content-Length', 0))
+                request_body = self.rfile.read(content_length).decode('utf-8')
+                
+                try:
+                    request_data = json.loads(request_body)
+                except json.JSONDecodeError:
+                    self.send_error(400, 'Invalid JSON in request body')
+                    return
+                
+                # Handle the tool call
+                response = self.handle_tool_call(request_data)
+                
+                # Send response
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                response_json = json.dumps(response, indent=2, default=str)
+                self.wfile.write(response_json.encode('utf-8'))
+                
+            except Exception as e:
+                self.send_error(500, f'Internal Server Error: {str(e)}')
+                traceback.print_exc()
+        
+        def handle_tool_call(self, request_data):
+            """Handle tool execution requests."""
+            tool_name = request_data.get('tool')
+            arguments = request_data.get('arguments', {})
+            
+            if not tool_name:
+                return {
+                    "error": "Missing 'tool' parameter in request",
+                    "example": {
+                        "tool": "user_profile",
+                        "arguments": {}
+                    }
+                }
+            
+            try:
+                # Map tool names to functions
+                tool_functions = {
+                    'user_profile': user_profile,
+                    'user_settings': user_settings,
+                    'daily_steps': daily_steps,
+                    'daily_sleep': daily_sleep,
+                    'daily_hydration': daily_hydration,
+                    'daily_body_battery': daily_body_battery,
+                    'daily_hrv': daily_hrv,
+                    'weekly_steps': weekly_steps,
+                    'weekly_intensity_minutes': weekly_intensity_minutes,
+                    'hrv_data': hrv_data,
+                    'nightly_sleep': nightly_sleep,
+                    'daily_stress': daily_stress,
+                    'weekly_stress': weekly_stress,
+                    'daily_intensity_minutes': daily_intensity_minutes,
+                    'get_activities': get_activities,
+                    'get_activities_by_date': get_activities_by_date,
+                    'get_activity_details': get_activity_details,
+                    'get_activity_splits': get_activity_splits,
+                    'get_activity_weather': get_activity_weather,
+                    'get_body_composition': get_body_composition,
+                    'get_respiration_data': get_respiration_data,
+                    'get_spo2_data': get_spo2_data,
+                    'get_blood_pressure': get_blood_pressure,
+                    'get_devices': get_devices,
+                    'get_device_settings': get_device_settings,
+                    'get_gear': get_gear,
+                    'get_gear_stats': get_gear_stats,
+                    'get_connectapi_endpoint': get_connectapi_endpoint,
+                    'monthly_activity_summary': monthly_activity_summary,
+                    'snapshot': snapshot,
+                }
+                
+                if tool_name not in tool_functions:
+                    return {
+                        "error": f"Unknown tool: {tool_name}",
+                        "available_tools": list(tool_functions.keys())
+                    }
+                
+                # Execute the tool function
+                tool_func = tool_functions[tool_name]
+                
+                # Call the function with provided arguments
+                if arguments:
+                    result = tool_func(**arguments)
+                else:
+                    result = tool_func()
+                
+                return {
+                    "tool": tool_name,
+                    "result": result,
+                    "status": "success"
+                }
+                
+            except Exception as e:
+                return {
+                    "tool": tool_name,
+                    "error": str(e),
+                    "status": "error"
+                }
+        
+        def log_message(self, format, *args):
+            """Override to customize logging."""
+            print(f"[{self.address_string()}] {format % args}")
+    
+    print(f"🚀 Garth MCP HTTP Server starting...")
+    print(f"📍 Server URL: http://{host}:{port}")
+    print(f"🔑 Authentication: Bearer token required")
+    print(f"📊 Health check: GET http://{host}:{port}/health")
+    print(f"🛠️  Available tools: GET http://{host}:{port}/tools")
+    print(f"⚡ Tool execution: POST http://{host}:{port}/")
+    print(f"")
+    print(f"💡 Usage example:")
+    print(f"   curl -H 'Authorization: Bearer <your_garth_token>' \\")
+    print(f"        -H 'Content-Type: application/json' \\")
+    print(f"        -d '{{\"tool\": \"user_profile\", \"arguments\": {{}}}}' \\")
+    print(f"        http://{host}:{port}/")
+    print(f"")
+    print(f"🔗 For n8n MCP Client, use:")
+    print(f"   - URL: http://{host}:{port}/")
+    print(f"   - Auth: Bearer")
+    print(f"   - Token: <your_garth_token>")
+    
+    httpd = HTTPServer((host, port), MCPHTTPHandler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down HTTP server...")
+        httpd.shutdown()
 
 
 if __name__ == "__main__":

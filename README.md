@@ -6,11 +6,30 @@
 
 Garmin Connect MCP server based on [garth](https://github.com/matin/garth).
 
+**Now supports HTTP streaming for n8n MCP Client compatibility!**
+
 ## Usage
+
+### Standard MCP Client (stdio)
 
 ![image](https://github.com/user-attachments/assets/14221e6f-5f65-4c21-bc7a-2147c1c9efc1)
 
+### HTTP Streaming Mode (n8n MCP Client)
+
+Run as an HTTP server with Bearer token authentication:
+
+```bash
+garth-mcp-server --http --port 8000
+```
+
+Or using Python directly:
+```bash
+python -m garth_mcp_server --http --port 8000
+```
+
 ## Install
+
+### Standard MCP Client
 
 ```json
 {
@@ -26,6 +45,45 @@ Garmin Connect MCP server based on [garth](https://github.com/matin/garth).
     }
   }
 }
+```
+
+### n8n MCP Client (HTTP)
+
+For n8n MCP Client, start the server in HTTP mode:
+
+```bash
+# Start HTTP server
+garth-mcp-server --http --host 0.0.0.0 --port 8000
+```
+
+Then configure n8n MCP Client:
+- **URL**: `http://your-server:8000/`
+- **Authentication**: Bearer
+- **Token**: `<output of garth login>`
+
+### HTTP API Endpoints
+
+Once running in HTTP mode:
+
+- **Health Check**: `GET /health` - Server status
+- **List Tools**: `GET /tools` (requires Bearer auth)
+- **Execute Tool**: `POST /` (requires Bearer auth)
+
+#### Example HTTP Usage
+
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# List available tools
+curl -H "Authorization: Bearer <your_garth_token>" \
+     http://localhost:8000/tools
+
+# Execute a tool
+curl -H "Authorization: Bearer <your_garth_token>" \
+     -H "Content-Type: application/json" \
+     -d '{"tool": "user_profile", "arguments": {}}' \
+     http://localhost:8000/
 ```
 
 Make sure the path for the `uvx` command is fully scoped as MCP doesn't
