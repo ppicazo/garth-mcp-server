@@ -3,7 +3,7 @@ name = "garth-mcp-server"
 dynamic = ["version"]
 description = "Garmin Connect MCP server"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 authors = [
     {name = "Matin Tamizi", email = "mtamizi@duck.com"},
 ]
